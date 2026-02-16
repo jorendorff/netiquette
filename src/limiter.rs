@@ -1,11 +1,13 @@
 // TODO: deal with HTTP redirects - they should not circumvent the policy
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
-use std::time::{Duration};
+use std::time::Duration;
 
 use moka::sync::Cache;
-use reqwest::{Client, Url, StatusCode, Response};
-use robotstxt::matcher::{RobotsMatcher, LongestMatchRobotsMatchStrategy};
+use reqwest::{Client, Response, StatusCode, Url};
+use robotstxt::matcher::{LongestMatchRobotsMatchStrategy, RobotsMatcher};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::time::Instant;
 
@@ -23,7 +25,13 @@ use crate::error::{Error, ErrorKind, Result};
 pub struct Limiter {
     client: Client,
     user_agent: String,
-    hosts: Cache<HostKey, Arc<Mutex<Host>>>,
+    domains: Cache<String, Arc<Mutex<Domain>>>,
+}
+
+struct Domain {
+    /// When to allow the next request. See `MIN_DELAY`.
+    next_access: Instant,
+    hosts: HashMap<HostKey, Host>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -32,17 +40,12 @@ struct HostKey {
     port: u16,
 }
 
-enum Host {
-    Uninit,
-    Ready {
-        /// When to allow the next request. See `MIN_DELAY`.
-        next_access: Instant,
-        /// Content of `/robots.txt` for this host.
-        /// (TODO - parse and keep only the parts relevant for our user_agent)
-        robots_txt: Option<String>,
-        /// When robots.txt was last fetched. See `ROBOTS_TXT_FRESHNESS`.
-        robots_last_fetch: Instant,
-    },
+struct Host {
+    /// Content of `/robots.txt` for this host.
+    /// (TODO - parse and keep only the parts relevant for our user_agent)
+    robots_txt: Option<String>,
+    /// When robots.txt was last fetched. See `ROBOTS_TXT_FRESHNESS`.
+    robots_last_fetch: Instant,
 }
 
 /// Permit to fetch a URL, returned by [`Limiter::acquire`].
@@ -50,7 +53,7 @@ enum Host {
 /// Dropping this frees up the permit, so that a permit can be issued to another async task for a
 /// URL on the same host.
 pub struct Permit {
-    host_guard: OwnedMutexGuard<Host>,
+    domain_guard: OwnedMutexGuard<Domain>,
 }
 
 /// Rather strict limit on policy length. Even Wikipedia's policy is nowhere near this long;
@@ -73,70 +76,93 @@ const DISALLOW_ALL: &str = "user-agent: *\ndisallow: /\n";
 /// one host at a high rate.
 const MIN_DELAY: Duration = Duration::from_secs(1);
 
-impl Drop for Permit {
-    fn drop(&mut self) {
-        // Work complete! Enforce the minimum delay between this request and the next.
-        if let Host::Ready { next_access, .. } = &mut *self.host_guard {
-            *next_access = Instant::now() + MIN_DELAY;
-        }
-        // Dropping self.host_guard releases the mutex so that the next task can get a permit.
+impl Domain {
+    fn new() -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Domain {
+            next_access: Instant::now(),
+            hosts: HashMap::new(),
+        }))
     }
 }
 
-impl Host {
-    fn new() -> Arc<Mutex<Self>> {
-        Arc::new(Mutex::new(Host::Uninit))
+impl Drop for Permit {
+    fn drop(&mut self) {
+        // Work complete! Enforce the minimum delay between this request and the next.
+        self.domain_guard.next_access = Instant::now() + MIN_DELAY;
+        // Dropping self.domain_guard releases the mutex so that the next task can get a permit.
     }
+}
 
-    async fn robots(&mut self, client: &Client, url: &Url) -> Result<Option<&str>> {
-        let need_fetch = match self {
-            Host::Uninit => true,
-            Host::Ready { robots_last_fetch: last_fetch, .. } => last_fetch.elapsed() > ROBOTS_TXT_FRESHNESS,
-        };
+impl Domain {
+    async fn robots(
+        &mut self,
+        client: &Client,
+        host_key: HostKey,
+        url: &Url,
+    ) -> Result<Option<&str>> {
+        let host_entry = self.hosts.entry(host_key);
 
-        if need_fetch {
-            let timeout_at = Instant::now() + ROBOTS_TXT_FETCH_TIMEOUT;
-            let response = client
-                .get(
-                    url.join("/robots.txt")
-                        .expect("fixed string is a valid relative URL"),
-                )
-                .timeout(ROBOTS_TXT_FETCH_TIMEOUT)
-                .send()
-                .await?;
-            let robots_txt = if response.status() == StatusCode::NOT_FOUND {
-                // 404 Not Found is great; it means the site has no policy.
-                None
-            } else {
-                // but treat any other error as a policy against all robots.
-                match tokio::time::timeout_at(timeout_at, read_response(response)).await {
-                    Ok(Ok(text)) => Some(text),
-                    _ => Some(DISALLOW_ALL.to_string()),
-                }
+        if let Entry::Occupied(e) = &host_entry
+            && e.get().robots_last_fetch.elapsed() <= ROBOTS_TXT_FRESHNESS
+        {
+            let Entry::Occupied(e) = host_entry else {
+                panic!("just confirmed match");
             };
-            let now = Instant::now();
-            *self = Host::Ready {
-                next_access: now,
-                robots_last_fetch: now,
-                robots_txt,
-            };
+            return Ok(e.into_mut().robots_txt.as_deref());
         }
 
-        let Host::Ready { robots_txt, .. } = self else {
-            panic!("just initialized");
+        let timeout_at = Instant::now() + ROBOTS_TXT_FETCH_TIMEOUT;
+        let response = client
+            .get(
+                url.join("/robots.txt")
+                    .expect("fixed string is a valid relative URL"),
+            )
+            .timeout(ROBOTS_TXT_FETCH_TIMEOUT)
+            .send()
+            .await?;
+        let robots_txt = if response.status() == StatusCode::NOT_FOUND {
+            // 404 Not Found is great; it means the site has no policy.
+            None
+        } else {
+            // but treat any other error as a policy against all robots. Many different errors are
+            // possible: the spider's network access is down; the server is permanently down or
+            // gone; an HTTP 403 Forbidden or 429 Too Many Requests response; an HTTP 500 Server
+            // Error. Most of these at least suggest we shouldn't try to crawl the host.
+            match tokio::time::timeout_at(timeout_at, read_response(response)).await {
+                Ok(Ok(text)) => Some(text),
+                _ => Some(DISALLOW_ALL.to_string()),
+            }
         };
-        Ok(robots_txt.as_deref())
+        let now = Instant::now();
+
+        let host = match host_entry {
+            Entry::Vacant(e) => e.insert(Host {
+                robots_last_fetch: now,
+                robots_txt,
+            }),
+            Entry::Occupied(e) => {
+                let host = e.into_mut();
+                host.robots_last_fetch = now;
+                host.robots_txt = robots_txt;
+                host
+            }
+        };
+        Ok(host.robots_txt.as_deref())
     }
 }
 
 struct AnyError;
 
 impl From<reqwest::Error> for AnyError {
-    fn from(_err: reqwest::Error) -> Self { AnyError }
+    fn from(_err: reqwest::Error) -> Self {
+        AnyError
+    }
 }
 
 impl From<std::string::FromUtf8Error> for AnyError {
-    fn from(_err: std::string::FromUtf8Error) -> Self { AnyError }
+    fn from(_err: std::string::FromUtf8Error) -> Self {
+        AnyError
+    }
 }
 
 async fn read_response(response: Response) -> Result<String, AnyError> {
@@ -145,13 +171,12 @@ async fn read_response(response: Response) -> Result<String, AnyError> {
     let mut bytes = vec![];
     while let Some(chunk) = response.chunk().await? {
         if bytes.len() + chunk.len() > ROBOTS_TXT_LIMIT_BYTES {
-            return Err(AnyError);  // response too large
+            return Err(AnyError); // response too large
         }
         bytes.extend_from_slice(&chunk);
     }
     Ok(String::from_utf8(bytes)?)
 }
-
 
 impl Limiter {
     /// Create a new rate limiter. `client` is used to fetch `robots.txt` from hosts. `user_agent`
@@ -164,11 +189,11 @@ impl Limiter {
     /// (The caller is responsible for configuring `client` to use this user agent string,
     /// since it's not configurable once the client is created.)
     pub fn new(client: Client, user_agent: String) -> Self {
-        let hosts = Cache::builder().max_capacity(1_000_000).build();
+        let domains = Cache::builder().max_capacity(1_000_000).build();
         Limiter {
             client,
             user_agent,
-            hosts,
+            domains,
         }
     }
 
@@ -199,12 +224,18 @@ impl Limiter {
                 kind: ErrorKind::InvalidUrl,
             });
         };
-        let hostname = host_str.to_lowercase();
-        let key = HostKey { hostname, port };
+        let Some(domain) = psl::domain_str(host_str) else {
+            return Err(Error {
+                kind: ErrorKind::InvalidUrl,
+            });
+        };
+        let key = domain.to_lowercase();
 
-        let host_mutex = self.hosts.get_with(key, Host::new).clone();
-        let mut host_guard = host_mutex.lock_owned().await;
-        if let Some(robots_txt) = host_guard.robots(&self.client, url).await? {
+        let domain_mutex = self.domains.get_with(key, Domain::new).clone();
+        let mut domain_guard = domain_mutex.lock_owned().await;
+        let hostname = host_str.to_lowercase();
+        let host_key = HostKey { hostname, port };
+        if let Some(robots_txt) = domain_guard.robots(&self.client, host_key, url).await? {
             let mut matcher = RobotsMatcher::<LongestMatchRobotsMatchStrategy>::default();
             if !matcher.one_agent_allowed_by_robots(robots_txt, &self.user_agent, url.as_str()) {
                 return Err(Error {
@@ -213,13 +244,10 @@ impl Limiter {
             }
         }
 
-        let Host::Ready { next_access, .. } = &mut *host_guard else {
-            panic!("just successfully called robots()");
-        };
-        if Instant::now() < *next_access {
-            tokio::time::sleep_until(*next_access).await;
+        if Instant::now() < domain_guard.next_access {
+            tokio::time::sleep_until(domain_guard.next_access).await;
         }
 
-        Ok(Permit{ host_guard })
+        Ok(Permit { domain_guard })
     }
 }
