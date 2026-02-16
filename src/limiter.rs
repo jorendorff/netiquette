@@ -1,12 +1,13 @@
 // TODO: deal with HTTP redirects - they should not circumvent the policy
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration};
 
 use moka::sync::Cache;
 use reqwest::{Client, Url, StatusCode, Response};
 use robotstxt::matcher::{RobotsMatcher, LongestMatchRobotsMatchStrategy};
 use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::time::Instant;
 
 use crate::error::{Error, ErrorKind, Result};
 
@@ -34,8 +35,13 @@ struct HostKey {
 enum Host {
     Uninit,
     Ready {
-        last_fetch: Instant,
-        robots_txt: Option<String>, // TODO - parse and keep only the parts relevant for our user_agent
+        /// When to allow the next request. See `MIN_DELAY`.
+        next_access: Instant,
+        /// Content of `/robots.txt` for this host.
+        /// (TODO - parse and keep only the parts relevant for our user_agent)
+        robots_txt: Option<String>,
+        /// When robots.txt was last fetched. See `ROBOTS_TXT_FRESHNESS`.
+        robots_last_fetch: Instant,
     },
 }
 
@@ -44,8 +50,7 @@ enum Host {
 /// Dropping this frees up the permit, so that a permit can be issued to another async task for a
 /// URL on the same host.
 pub struct Permit {
-    #[expect(dead_code, reason = "this exists to free the Host mutex on drop")]
-    inner: OwnedMutexGuard<Host>,
+    host_guard: OwnedMutexGuard<Host>,
 }
 
 /// Rather strict limit on policy length. Even Wikipedia's policy is nowhere near this long;
@@ -61,6 +66,23 @@ const ROBOTS_TXT_FRESHNESS: Duration = Duration::from_secs(24 * 60 * 60);
 
 const DISALLOW_ALL: &str = "user-agent: *\ndisallow: /\n";
 
+/// Minimum pause between the end of one request and the beginning of the next (not counting
+/// requests for `/robots.txt`). We allow one request per second, on the theory that (1) most web
+/// sites will consider that an acceptable pace, so we shouldn't get rate-limited; (2) any spider
+/// typically crawls many web sites concurrently, so it's not like the spider needs to hammer any
+/// one host at a high rate.
+const MIN_DELAY: Duration = Duration::from_secs(1);
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        // Work complete! Enforce the minimum delay between this request and the next.
+        if let Host::Ready { next_access, .. } = &mut *self.host_guard {
+            *next_access = Instant::now() + MIN_DELAY;
+        }
+        // Dropping self.host_guard releases the mutex so that the next task can get a permit.
+    }
+}
+
 impl Host {
     fn new() -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(Host::Uninit))
@@ -69,11 +91,11 @@ impl Host {
     async fn robots(&mut self, client: &Client, url: &Url) -> Result<Option<&str>> {
         let need_fetch = match self {
             Host::Uninit => true,
-            Host::Ready { last_fetch, .. } => last_fetch.elapsed() > ROBOTS_TXT_FRESHNESS,
+            Host::Ready { robots_last_fetch: last_fetch, .. } => last_fetch.elapsed() > ROBOTS_TXT_FRESHNESS,
         };
-        
+
         if need_fetch {
-            let timeout_at = tokio::time::Instant::now() + ROBOTS_TXT_FETCH_TIMEOUT;
+            let timeout_at = Instant::now() + ROBOTS_TXT_FETCH_TIMEOUT;
             let response = client
                 .get(
                     url.join("/robots.txt")
@@ -92,8 +114,10 @@ impl Host {
                     _ => Some(DISALLOW_ALL.to_string()),
                 }
             };
+            let now = Instant::now();
             *self = Host::Ready {
-                last_fetch: Instant::now(),
+                next_access: now,
+                robots_last_fetch: now,
                 robots_txt,
             };
         }
@@ -179,8 +203,8 @@ impl Limiter {
         let key = HostKey { hostname, port };
 
         let host_mutex = self.hosts.get_with(key, Host::new).clone();
-        let mut guard = host_mutex.lock_owned().await;
-        if let Some(robots_txt) = guard.robots(&self.client, url).await? {
+        let mut host_guard = host_mutex.lock_owned().await;
+        if let Some(robots_txt) = host_guard.robots(&self.client, url).await? {
             let mut matcher = RobotsMatcher::<LongestMatchRobotsMatchStrategy>::default();
             if !matcher.one_agent_allowed_by_robots(robots_txt, &self.user_agent, url.as_str()) {
                 return Err(Error {
@@ -188,6 +212,14 @@ impl Limiter {
                 });
             }
         }
-        Ok(Permit{inner: guard})
+
+        let Host::Ready { next_access, .. } = &mut *host_guard else {
+            panic!("just successfully called robots()");
+        };
+        if Instant::now() < *next_access {
+            tokio::time::sleep_until(*next_access).await;
+        }
+
+        Ok(Permit{ host_guard })
     }
 }
