@@ -17,7 +17,7 @@ use crate::error::{Error, ErrorKind, Result};
 ///
 /// See the crate-level documentation for an example.
 ///
-/// This rate-limiter contains an LRU cache of Internet hosts and their `robots.txt` policies (if
+/// This rate-limiter contains an LRU cache of Internet domains and their `robots.txt` policies (if
 /// any). If the host has no `/robots.txt` file (it's a 404), then we permit crawling the host. If
 /// fetching `/robots.txt` fails with any other network error, or times out, or the policy is huge
 /// (over 500 KiB), we mark the host as having banned us. The limiter will retry when the
@@ -28,9 +28,11 @@ pub struct Limiter {
     domains: Cache<String, Arc<Mutex<Domain>>>,
 }
 
+/// A single web domain (eTLD+1).
 struct Domain {
     /// When to allow the next request. See `MIN_DELAY`.
     next_access: Instant,
+    /// Stores robots.txt for each host we've encountered in this domain.
     hosts: HashMap<HostKey, Host>,
 }
 
@@ -41,7 +43,7 @@ struct HostKey {
 }
 
 struct Host {
-    /// Content of `/robots.txt` for this host.
+    /// Content of `/robots.txt` for this host, if any.
     /// (TODO - parse and keep only the parts relevant for our user_agent)
     robots_txt: Option<String>,
     /// When robots.txt was last fetched. See `ROBOTS_TXT_FRESHNESS`.
