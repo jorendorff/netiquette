@@ -2,6 +2,12 @@
 name = "netiquette"
 version = "0.1.0"
 edition = "2024"
+description = "A rate-limiter for politely crawling the Web"
+documentation = "https://docs.rs/netiquette"
+readme = "README.md"
+homepage = "https://github.com/jorendorff/netiquette"
+repository = "https://github.com/jorendorff/netiquette"
+license = "MIT or Apache-2.0"
 
 [dependencies]
 moka = { version = "0.12.13", features = ["sync"] }
