@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use moka::sync::Cache;
 use reqwest::{Client, Response, StatusCode, Url};
-use robotstxt::matcher::{LongestMatchRobotsMatchStrategy, RobotsMatcher};
+use texting_robots::Robot;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::time::Instant;
 
@@ -30,8 +30,8 @@ pub struct Limiter {
 
 /// A single web domain (eTLD+1).
 struct Domain {
-    /// When to allow the next request. See `MIN_DELAY`.
-    next_access: Instant,
+    /// Timestamp at the end of the previous request. See `MIN_DELAY`.
+    last_access: Instant,
     /// Stores robots.txt for each host we've encountered in this domain.
     hosts: HashMap<HostKey, Host>,
 }
@@ -43,9 +43,8 @@ struct HostKey {
 }
 
 struct Host {
-    /// Content of `/robots.txt` for this host, if any.
-    /// (TODO - parse and keep only the parts relevant for our user_agent)
-    robots_txt: Option<String>,
+    /// Rules from this host's `/robots.txt`, if any.
+    robot_rules: Option<Robot>,
     /// When robots.txt was last fetched. See `ROBOTS_TXT_FRESHNESS`.
     robots_last_fetch: Instant,
 }
@@ -76,12 +75,19 @@ const DISALLOW_ALL: &str = "user-agent: *\ndisallow: /\n";
 /// sites will consider that an acceptable pace, so we shouldn't get rate-limited; (2) any spider
 /// typically crawls many web sites concurrently, so it's not like the spider needs to hammer any
 /// one host at a high rate.
-const MIN_DELAY: Duration = Duration::from_secs(1);
+///
+/// This is just a minimum; we also honor the `Delay` setting if present in robots.txt.
+const MIN_DELAY: f32 = 1.0;
+
+/// A robots.txt file can specify a very long `Delay`, a sort of reverse DoS. We decline to
+/// actually sleep for long periods of time; instead, treat that as a ban.
+const MAX_DELAY: f32 = 30.0;
 
 impl Domain {
     fn new() -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(Domain {
-            next_access: Instant::now(),
+            // There is no previous access, so choose any elapsed time.
+            last_access: Instant::now() - Duration::from_secs_f32(MAX_DELAY),
             hosts: HashMap::new(),
         }))
     }
@@ -89,19 +95,20 @@ impl Domain {
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        // Work complete! Enforce the minimum delay between this request and the next.
-        self.domain_guard.next_access = Instant::now() + MIN_DELAY;
+        // Work complete! Stash the time so the next request can honor `Delay`.
+        self.domain_guard.last_access = Instant::now();
         // Dropping self.domain_guard releases the mutex so that the next task can get a permit.
     }
 }
 
 impl Domain {
-    async fn robots(
+    async fn robot_rules(
         &mut self,
         client: &Client,
+        user_agent: &str,
         host_key: HostKey,
         url: &Url,
-    ) -> Result<Option<&str>> {
+    ) -> Result<Option<&Robot>> {
         let host_entry = self.hosts.entry(host_key);
 
         if let Entry::Occupied(e) = &host_entry
@@ -110,7 +117,7 @@ impl Domain {
             let Entry::Occupied(e) = host_entry else {
                 panic!("just confirmed match");
             };
-            return Ok(e.into_mut().robots_txt.as_deref());
+            return Ok(e.into_mut().robot_rules.as_ref());
         }
 
         let timeout_at = Instant::now() + ROBOTS_TXT_FETCH_TIMEOUT;
@@ -122,7 +129,7 @@ impl Domain {
             .timeout(ROBOTS_TXT_FETCH_TIMEOUT)
             .send()
             .await?;
-        let robots_txt = if response.status() == StatusCode::NOT_FOUND {
+        let robot_rules = if response.status() == StatusCode::NOT_FOUND {
             // 404 Not Found is great; it means the site has no policy.
             None
         } else {
@@ -130,26 +137,38 @@ impl Domain {
             // possible: the spider's network access is down; the server is permanently down or
             // gone; an HTTP 403 Forbidden or 429 Too Many Requests response; an HTTP 500 Server
             // Error. Most of these at least suggest we shouldn't try to crawl the host.
-            match tokio::time::timeout_at(timeout_at, read_response(response)).await {
-                Ok(Ok(text)) => Some(text),
-                _ => Some(DISALLOW_ALL.to_string()),
+            let txt = match tokio::time::timeout_at(timeout_at, read_response(response)).await {
+                Ok(Ok(text)) => text,
+                _ => DISALLOW_ALL.to_string(),
+            };
+            let mut robot = Robot::new(user_agent, txt.as_bytes()).unwrap_or_else(|_err| {
+                // Error parsing robots.txt. This is rare; interpret it as a ban.
+                Robot::new(user_agent, DISALLOW_ALL.as_bytes()).unwrap()
+            });
+
+            if let Some(delay) = robot.delay
+                && delay > MAX_DELAY
+            {
+                robot = Robot::new(user_agent, DISALLOW_ALL.as_bytes()).unwrap();
             }
+            Some(robot)
         };
+
         let now = Instant::now();
 
         let host = match host_entry {
             Entry::Vacant(e) => e.insert(Host {
                 robots_last_fetch: now,
-                robots_txt,
+                robot_rules,
             }),
             Entry::Occupied(e) => {
                 let host = e.into_mut();
                 host.robots_last_fetch = now;
-                host.robots_txt = robots_txt;
+                host.robot_rules = robot_rules;
                 host
             }
         };
-        Ok(host.robots_txt.as_deref())
+        Ok(host.robot_rules.as_ref())
     }
 }
 
@@ -237,17 +256,24 @@ impl Limiter {
         let mut domain_guard = domain_mutex.lock_owned().await;
         let hostname = host_str.to_lowercase();
         let host_key = HostKey { hostname, port };
-        if let Some(robots_txt) = domain_guard.robots(&self.client, host_key, url).await? {
-            let mut matcher = RobotsMatcher::<LongestMatchRobotsMatchStrategy>::default();
-            if !matcher.one_agent_allowed_by_robots(robots_txt, &self.user_agent, url.as_str()) {
+        let mut delay = MIN_DELAY;
+        if let Some(robot_rules) = domain_guard
+            .robot_rules(&self.client, &self.user_agent, host_key, url)
+            .await?
+        {
+            if !robot_rules.allowed(url.as_str()) {
                 return Err(Error {
                     kind: ErrorKind::Disallowed,
                 });
             }
+            if let Some(d) = robot_rules.delay {
+                delay = d;
+            }
         }
 
-        if Instant::now() < domain_guard.next_access {
-            tokio::time::sleep_until(domain_guard.next_access).await;
+        let next_access = domain_guard.last_access + Duration::from_secs_f32(delay);
+        if Instant::now() < next_access {
+            tokio::time::sleep_until(next_access).await;
         }
 
         Ok(Permit { domain_guard })

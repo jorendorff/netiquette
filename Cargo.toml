@@ -7,5 +7,5 @@ edition = "2024"
 moka = { version = "0.12.13", features = ["sync"] }
 psl = "2.1.190"
 reqwest = "0.13.2"
-robotstxt = "0.3.0"
+texting_robots = "0.2.2"
 tokio = { version = "1.49.0", features = ["sync"] }
