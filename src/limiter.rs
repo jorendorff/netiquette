@@ -47,6 +47,8 @@ struct Host {
     robot_rules: Option<Robot>,
     /// When robots.txt was last fetched. See `ROBOTS_TXT_FRESHNESS`.
     robots_last_fetch: Instant,
+    /// Counts errors that should trigger exponential backoff.
+    backoff_error_count: i32,
 }
 
 /// Permit to fetch a URL, returned by [`Limiter::acquire`].
@@ -93,6 +95,24 @@ impl Domain {
     }
 }
 
+impl HostKey {
+    fn from_url(url: &Url) -> Result<Self> {
+        let scheme = url.scheme();
+        if scheme != "http" && scheme != "https" {
+            return Err(Error {
+                kind: ErrorKind::NotHttp,
+            });
+        }
+        let (Some(host_str), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+            return Err(Error {
+                kind: ErrorKind::InvalidUrl,
+            });
+        };
+        let hostname = host_str.to_lowercase();
+        Ok(HostKey { hostname, port })
+    }
+}
+
 impl Drop for Permit {
     fn drop(&mut self) {
         // Work complete! Stash the time so the next request can honor `Delay`.
@@ -101,14 +121,37 @@ impl Drop for Permit {
     }
 }
 
+impl Permit {
+    fn should_back_off(&self, err: reqwest::Error) -> bool {
+        // 404 Not Found is considered normal and not an indication that we should back off. All
+        // other errors, including 403 Forbidden, 429 Too Many Requests, 503 Service Unavailable,
+        // "connection reset by peer", and "no route to host", should eventually lead to us giving
+        // up if they happen repeatedly. We use the same mechanism for all of them.
+        !matches!(err.status(), Some(StatusCode::NOT_FOUND))
+    }
+
+    /// Report that an error happened trying to fetch the given URL. Netiquette may react by slowing down
+    /// the pace of requests permitted to the host or stopping them altogether.
+    ///
+    /// This is not an ideal API because netiquette has no way to access the `Retry-After` header.
+    pub fn note_error(mut self, url: &Url, err: reqwest::Error) {
+        if self.should_back_off(err) &&
+            let Ok(host_key) = HostKey::from_url(url) &&
+            let Some(host) = self.domain_guard.hosts.get_mut(&host_key)
+        {
+            host.backoff_error_count += 1;
+        }
+    }
+}
+
 impl Domain {
-    async fn robot_rules(
+    async fn get_host(
         &mut self,
         client: &Client,
         user_agent: &str,
         host_key: HostKey,
         url: &Url,
-    ) -> Result<Option<&Robot>> {
+    ) -> Result<&mut Host> {
         let host_entry = self.hosts.entry(host_key);
 
         if let Entry::Occupied(e) = &host_entry
@@ -117,7 +160,7 @@ impl Domain {
             let Entry::Occupied(e) = host_entry else {
                 panic!("just confirmed match");
             };
-            return Ok(e.into_mut().robot_rules.as_ref());
+            return Ok(e.into_mut());
         }
 
         let timeout_at = Instant::now() + ROBOTS_TXT_FETCH_TIMEOUT;
@@ -160,15 +203,17 @@ impl Domain {
             Entry::Vacant(e) => e.insert(Host {
                 robots_last_fetch: now,
                 robot_rules,
+                backoff_error_count: 0,
             }),
             Entry::Occupied(e) => {
                 let host = e.into_mut();
                 host.robots_last_fetch = now;
                 host.robot_rules = robot_rules;
+                host.backoff_error_count = 0;
                 host
             }
         };
-        Ok(host.robot_rules.as_ref())
+        Ok(host)
     }
 }
 
@@ -234,33 +279,23 @@ impl Limiter {
     /// - there's an error or timeout trying to fetch `robots.txt`
     /// - the site's `robots.txt` disallows crawling the path
     pub async fn acquire(&self, url: &Url) -> Result<Permit> {
-        let scheme = url.scheme();
-        if scheme != "http" && scheme != "https" {
-            return Err(Error {
-                kind: ErrorKind::NotHttp,
-            });
-        }
-        let (Some(host_str), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+        let host_key = HostKey::from_url(url)?;
+        let Some(domain) = psl::domain_str(&host_key.hostname) else {
             return Err(Error {
                 kind: ErrorKind::InvalidUrl,
             });
         };
-        let Some(domain) = psl::domain_str(host_str) else {
-            return Err(Error {
-                kind: ErrorKind::InvalidUrl,
-            });
-        };
-        let key = domain.to_lowercase();
 
-        let domain_mutex = self.domains.get_with(key, Domain::new).clone();
+        // Lock the domain (until we bail out or the permit we issue is dropped).
+        let domain_mutex = self.domains.get_with(domain.to_string(), Domain::new).clone();
         let mut domain_guard = domain_mutex.lock_owned().await;
-        let hostname = host_str.to_lowercase();
-        let host_key = HostKey { hostname, port };
+
+        // Check robots.txt for the host.
         let mut delay = MIN_DELAY;
-        if let Some(robot_rules) = domain_guard
-            .robot_rules(&self.client, &self.user_agent, host_key, url)
-            .await?
-        {
+        let host = domain_guard
+            .get_host(&self.client, &self.user_agent, host_key, url)
+            .await?;
+        if let Some(robot_rules) = &host.robot_rules {
             if !robot_rules.allowed(url.as_str()) {
                 return Err(Error {
                     kind: ErrorKind::Disallowed,
@@ -270,7 +305,14 @@ impl Limiter {
                 delay = d;
             }
         }
+        delay *= 2.0f32.powi(host.backoff_error_count); // exponential backoff
+        if delay > MAX_DELAY {
+            return Err(Error {
+                kind: ErrorKind::Disallowed,
+            });
+        }
 
+        // Honor delay settings.
         let next_access = domain_guard.last_access + Duration::from_secs_f32(delay);
         if Instant::now() < next_access {
             tokio::time::sleep_until(next_access).await;
