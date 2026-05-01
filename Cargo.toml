@@ -1,12 +1,12 @@
 [package]
 name = "netiquette"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "A rate-limiter for politely crawling the Web"
 documentation = "https://docs.rs/netiquette"
 readme = "README.md"
-homepage = "https://github.com/jorendorff/netiquette"
-repository = "https://github.com/jorendorff/netiquette"
+homepage = "https://github.com/ProgrammingRust/netiquette"
+repository = "https://github.com/ProgrammingRust/netiquette"
 license = "MIT or Apache-2.0"
 
 [dependencies]
